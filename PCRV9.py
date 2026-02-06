@@ -1,253 +1,215 @@
-# @title 🧬 PCR 戰情室 (v9.0 動態熱模擬版)
-# 加入「溫度滑桿」，可即時模擬不同 Annealing 溫度下的電泳結果
-
-%matplotlib inline
-import ipywidgets as widgets
-from IPython.display import display, clear_output
+import streamlit as st
 import matplotlib.pyplot as plt
 import numpy as np
-import threading
+from Bio.SeqUtils import MeltingTemp as mt
+from Bio.Seq import Seq
+from Bio.Blast import NCBIWWW
+from Bio.Blast import NCBIXML
 import time
 
-# 確保 Biopython 已載入
-try:
-    import Bio
-    from Bio.Blast import NCBIWWW
-    from Bio.Blast import NCBIXML
-    from Bio.SeqUtils import MeltingTemp as mt
-    from Bio.Seq import Seq
-except ImportError:
-    print("⚠️ 尚未偵測到 Biopython，請在 Anaconda Prompt 輸入 'pip install biopython' 安裝。")
+# 設定頁面資訊
+st.set_page_config(page_title="PCR 引子戰情室", page_icon="🧬", layout="wide")
 
-# ================= 全域變數 (儲存暫存資料用) =================
-raw_blast_data = {"f": [], "r": []} # 儲存原始 BLAST 結果
-primer_info = {"tm_f": 0, "tm_r": 0, "seq_f": "", "seq_r": ""}
-
-# ================= 核心計算與繪圖 =================
+# ================= 核心計算邏輯 =================
 
 def calculate_adjusted_tm(perfect_tm, identity_percent):
-    """
-    估算不完美結合時的 Tm 值
-    經驗法則：每 1% 的錯配 (Mismatch) 會導致 Tm 下降約 1-1.5°C
-    """
+    """估算不完美結合時的 Tm 值"""
     mismatch_percent = 100 - identity_percent
-    drop = mismatch_percent * 1.2 # 設定係數
+    drop = mismatch_percent * 1.2 
     return perfect_tm - drop
 
-def draw_dynamic_gel(products, current_temp, organism):
-    """繪製電泳圖 (互動版)"""
-    # 清除舊圖 (避免重疊)
-    plt.close('all')
+def calculate_pcr_conditions(product_size, tm_f, tm_r, enzyme):
+    tm_min = min(tm_f, tm_r)
+    anneal_temp = tm_min - 3 
+    if enzyme == "Taq":
+        rate, name = 60, "General Taq"
+    else:
+        rate, name = 30, "High-Fidelity"
+    ext_time = max(30, int((product_size / 1000) * rate))
+    return name, anneal_temp, ext_time
+
+# 使用 Streamlit 的快取功能，避免重複連線 NCBI
+@st.cache_data(show_spinner=False)
+def fetch_blast_data(f_seq, r_seq, organism, database):
+    """連線 NCBI 抓取資料 (會被快取)"""
     
-    fig = plt.figure(figsize=(8, 5), dpi=100)
-    ax = fig.add_subplot(111)
+    # 1. 計算 Tm
+    tm_f = mt.Tm_NN(Seq(f_seq.upper()))
+    tm_r = mt.Tm_NN(Seq(r_seq.upper()))
+    
+    # 2. BLAST Forward
+    rh_f = NCBIWWW.qblast("blastn", database, f_seq, entrez_query=f'"{organism}"[Organism]', expect=50000, word_size=7)
+    rec_f = NCBIXML.read(rh_f)
+    
+    # 3. BLAST Reverse
+    rh_r = NCBIWWW.qblast("blastn", database, r_seq, entrez_query=f'"{organism}"[Organism]', expect=50000, word_size=7)
+    rec_r = NCBIXML.read(rh_r)
+    
+    # 4. 解析資料
+    parsed_f = []
+    for a in rec_f.alignments:
+        for h in a.hsps:
+            ident = (h.identities / h.align_length) * 100
+            parsed_f.append({'id': a.accession, 's': h.sbjct_start, 'str': h.frame[1], 't': a.title, 'ident': ident})
+            
+    parsed_r = []
+    for a in rec_r.alignments:
+        for h in a.hsps:
+            ident = (h.identities / h.align_length) * 100
+            parsed_r.append({'id': a.accession, 's': h.sbjct_start, 'str': h.frame[1], 't': a.title, 'ident': ident})
+            
+    return parsed_f, parsed_r, tm_f, tm_r
+
+def draw_gel_plot(products, temp_val, organism):
+    """繪製 Matplotlib 圖表"""
+    fig, ax = plt.subplots(figsize=(8, 5))
     ax.set_facecolor('black')
     
-    # 繪製 Marker
+    # Marker
     ladder = [100, 200, 300, 400, 500, 600, 800, 1000, 1500, 2000, 3000]
     for b in ladder:
         y = -np.log10(b)
         ax.hlines(y, 0.5, 1.5, colors='white', alpha=0.5)
-        ax.text(0.1, y, f"{b}", color='white', fontsize=7, va='center')
+        ax.text(0.1, y, f"{b}", color='white', fontsize=8, va='center')
 
-    # 繪製通過溫度篩選的產物
+    # Products
     visible_count = 0
     for i, p in enumerate(products):
         size = p['size']
         y = -np.log10(size)
         
-        # 判斷是否為主要產物 (通常 Identity 也是最高的)
         is_target = (p['f_ident'] == 100 and p['r_ident'] == 100)
         
         if is_target:
-            color, alpha, lw = '#00FF00', 1.0, 3.5 # 亮綠色
+            color, alpha, lw = '#00FF00', 1.0, 3.5
             label = f"{size}bp (Target)"
         else:
-            color, alpha, lw = 'yellow', 0.6, 2 # 黃色雜訊
+            color, alpha, lw = 'yellow', 0.6, 2
             label = f"{size}bp (Non-specific)"
             
         ax.hlines(y, 2.5, 3.5, colors=color, alpha=alpha, linewidth=lw)
-        # 為了避免文字重疊，只標示前幾個
-        if visible_count < 5:
+        if visible_count < 6: # 避免太多文字重疊
             ax.text(3.7, y, label, color=color, fontsize=9, va='center')
         visible_count += 1
 
     ax.set_xlim(0, 5)
     ax.set_ylim(-np.log10(3500), -np.log10(80))
     ax.set_xticks([1, 3])
-    ax.set_xticklabels(['Marker', f'PCR @ {current_temp}°C'])
+    ax.set_xticklabels(['Marker', f'PCR @ {temp_val}°C'])
     ax.set_yticks([])
-    ax.set_title(f"In-Silico PCR Simulation ({organism})", color='white')
-    
+    ax.set_title(f"In-Silico PCR Simulation: {organism}", color='white')
     plt.tight_layout()
-    display(fig) # 顯示圖表
+    return fig
 
-# ================= 互動模擬邏輯 =================
+# ================= Streamlit 介面佈局 =================
 
-def update_simulation(temp_val):
-    """當滑桿移動時，重新過濾並畫圖"""
-    
-    with sim_output:
-        clear_output(wait=True)
-        
-        # 取得儲存的原始資料
-        f_hits = raw_blast_data['f']
-        r_hits = raw_blast_data['r']
-        tm_perfect_f = primer_info['tm_f']
-        tm_perfect_r = primer_info['tm_r']
-        
-        products = []
-        
-        # 交叉比對並加入溫度過濾
-        for f in f_hits:
-            # 計算這條引子在這個位置的實際 Tm
-            hit_tm_f = calculate_adjusted_tm(tm_perfect_f, f['ident'])
-            
-            # 如果結合力低於設定溫度，引子會脫落 (不發生反應)
-            if hit_tm_f < temp_val: continue
+st.title("🧬 PCR 引子戰情室 (Streamlit Pro)")
+st.markdown("實驗室專用引子設計驗證與熱模擬系統")
 
-            for r in r_hits:
-                # 判斷是否在同一條染色體且方向正確
-                if f['id'] == r['id'] and f['str'] != r['str']:
-                    
-                    # 計算 Reverse 引子的實際 Tm
-                    hit_tm_r = calculate_adjusted_tm(tm_perfect_r, r['ident'])
-                    if hit_tm_r < temp_val: continue
-                    
-                    # 計算產物大小
-                    dist = abs(r['s'] - f['s']) + 1
-                    if 50 < dist < 5000:
-                        # 避免重複
-                        if not any(p['size'] == dist for p in products):
-                            products.append({
-                                'size': dist, 
-                                'gene': f['t'],
-                                'f_ident': f['ident'],
-                                'r_ident': r['ident']
-                            })
-        
-        products.sort(key=lambda x: x['size'])
-        
-        # 顯示文字報告
-        print(f"🌡️ 目前設定溫度: {temp_val}°C")
-        print(f"--------------------------------")
-        if not products:
-            print("❄️ 溫度過高！引子無法結合，沒有 PCR 產物。")
-            print("   (試著調低溫度滑桿)")
-        else:
-            print(f"📊 模擬結果: 共發現 {len(products)} 條產物")
-            for p in products:
-                status = "✅ 完美結合" if (p['f_ident']==100 and p['r_ident']==100) else "⚠️ 非專一性"
-                print(f"   - {p['size']} bp [{status}] (F:{p['f_ident']}%/R:{p['r_ident']}%)")
-            
-            # 畫圖
-            draw_dynamic_gel(products, temp_val, w_org.value)
+# Sidebar 設定區
+with st.sidebar:
+    st.header("⚙️ 參數設定")
+    organism = st.selectbox("目標物種", ["Homo sapiens", "Mus musculus", "Rattus norvegicus"])
+    database = st.selectbox("資料庫類型", ["refseq_rna", "nt"], index=0, help="mRNA用 refseq_rna, gDNA用 nt")
+    enzyme = st.selectbox("酵素類型", ["Taq", "High-Fidelity"])
+    st.info("💡 提示：輸入引子後按「開始分析」，完成後可調整溫度滑桿。")
 
-# ================= 介面宣告 =================
+# 主要輸入區
+col1, col2 = st.columns(2)
+with col1:
+    f_seq = st.text_input("Forward Primer (5'->3')", placeholder="輸入序列...").strip()
+with col2:
+    r_seq = st.text_input("Reverse Primer (5'->3')", placeholder="輸入序列...").strip()
 
-style = {'description_width': 'initial'}
-layout = widgets.Layout(width='98%')
-
-# 輸入區
-w_org = widgets.Dropdown(options=[('人類', 'Homo sapiens'), ('小鼠', 'Mus musculus')], value='Homo sapiens', description='物種:', style=style)
-w_db = widgets.Dropdown(options=[('mRNA', 'refseq_rna'), ('Genomic DNA', 'nt')], value='refseq_rna', description='資料庫:', style=style)
-w_fwd = widgets.Text(placeholder='Forward Primer', description='Fwd:', style=style, layout=layout)
-w_rev = widgets.Text(placeholder='Reverse Primer', description='Rev:', style=style, layout=layout)
-
-# 控制區
-btn_run = widgets.Button(description="1. 取得引子資料 (連線 NCBI)", button_style='primary', icon='cloud-download', layout=widgets.Layout(width='100%'))
-w_progress = widgets.IntProgress(value=0, max=100, description='進度:', bar_style='info', layout=widgets.Layout(width='100%'))
-log_output = widgets.Output() # 用來顯示連線進度
-
-# 模擬區 (一開始隱藏，跑完才出來)
-w_slider = widgets.FloatSlider(value=55.0, min=40.0, max=75.0, step=0.5, description='Annealing Temp (°C):', style=style, layout=layout)
-sim_output = widgets.Output() # 用來顯示即時圖表
-
-# ================= 執行邏輯 =================
-
-def run_blast_thread(f_seq, r_seq, organism, database):
-    global raw_blast_data, primer_info
-    
-    with log_output:
+# 分析按鈕與邏輯
+if st.button("🚀 開始分析 / 更新資料", type="primary"):
+    if not f_seq or not r_seq:
+        st.error("❌ 請輸入完整的 Fwd 和 Rev 引子序列！")
+    else:
         try:
-            w_progress.value = 10
-            print(f"🚀 開始連線 NCBI... 目標: {organism}")
-            
-            # 計算完美 Tm
-            tm_f = mt.Tm_NN(Seq(f_seq.upper()))
-            tm_r = mt.Tm_NN(Seq(r_seq.upper()))
-            primer_info = {"tm_f": tm_f, "tm_r": tm_r, "seq_f": f_seq, "seq_r": r_seq}
-            print(f"   引子 Tm: F={tm_f:.1f}°C, R={tm_r:.1f}°C")
-
-            # BLAST (使用較寬鬆的 expect 值以抓取非專一性 hits)
-            w_progress.value = 30
-            print("   ⏳ 正在下載 Forward 引子結合位點...")
-            rh_f = NCBIWWW.qblast("blastn", database, f_seq, entrez_query=f'"{organism}"[Organism]', expect=50000, word_size=7)
-            rec_f = NCBIXML.read(rh_f)
-            
-            w_progress.value = 60
-            print("   ⏳ 正在下載 Reverse 引子結合位點...")
-            rh_r = NCBIWWW.qblast("blastn", database, r_seq, entrez_query=f'"{organism}"[Organism]', expect=50000, word_size=7)
-            rec_r = NCBIXML.read(rh_r)
-            
-            w_progress.value = 90
-            print("   ✅ 資料下載完成！正在啟動熱模擬引擎...")
-            
-            # 解析並儲存 Raw Data
-            raw_blast_data['f'] = []
-            raw_blast_data['r'] = []
-            
-            # 提取詳細資訊 (包含 identity)
-            for a in rec_f.alignments:
-                for h in a.hsps:
-                    ident = (h.identities / h.align_length) * 100
-                    raw_blast_data['f'].append({'id': a.accession, 's': h.sbjct_start, 'str': h.frame[1], 't': a.title, 'ident': ident})
-
-            for a in rec_r.alignments:
-                for h in a.hsps:
-                    ident = (h.identities / h.align_length) * 100
-                    raw_blast_data['r'].append({'id': a.accession, 's': h.sbjct_start, 'str': h.frame[1], 't': a.title, 'ident': ident})
-
-            w_progress.value = 100
-            w_progress.bar_style = 'success'
-            print("🎉 準備就緒！請使用下方滑桿調整溫度。")
-            
-            # 啟動模擬介面
-            w_slider.value = min(tm_f, tm_r) - 5 # 預設溫度
-            widgets.interactive(update_simulation, temp_val=w_slider)
-            update_simulation(w_slider.value) # 觸發第一次繪圖
-
+            with st.spinner(f"正在連線 NCBI 資料庫比對 {organism}... (這可能需要 1-2 分鐘)"):
+                # 呼叫快取函數
+                data_f, data_r, tm_f, tm_r = fetch_blast_data(f_seq, r_seq, organism, database)
+                
+                # 將結果存入 Session State (讓滑桿互動時不用重跑)
+                st.session_state['blast_result'] = {
+                    'f': data_f, 'r': data_r, 
+                    'tm_f': tm_f, 'tm_r': tm_r,
+                    'done': True
+                }
+            st.success("✅ 分析完成！請查看下方模擬結果。")
         except Exception as e:
-            print(f"❌ 錯誤: {e}")
-        finally:
-            btn_run.disabled = False
+            st.error(f"發生錯誤: {e}")
 
-def on_button_click(b):
-    if not w_fwd.value.strip() or not w_rev.value.strip(): return
-    btn_run.disabled = True
-    log_output.clear_output()
-    sim_output.clear_output()
-    w_progress.value = 0
-    w_progress.bar_style = 'info'
+# ================= 結果顯示與熱模擬區 =================
+
+if 'blast_result' in st.session_state and st.session_state['blast_result']['done']:
+    res = st.session_state['blast_result']
     
-    # 啟動背景執行緒
-    threading.Thread(target=run_blast_thread, args=(w_fwd.value, w_rev.value, w_org.value, w_db.value)).start()
+    st.divider()
+    st.subheader("🎛️ 動態熱模擬實驗室")
+    
+    # 顯示基礎資訊
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Fwd Tm", f"{res['tm_f']:.1f} °C")
+    c2.metric("Rev Tm", f"{res['tm_r']:.1f} °C")
+    
+    # 溫度滑桿
+    default_temp = min(res['tm_f'], res['tm_r']) - 5
+    temp_val = st.slider("調整 Annealing 溫度 (°C)", min_value=40.0, max_value=75.0, value=default_temp, step=0.5)
+    
+    # --- 即時計算產物 ---
+    products = []
+    f_hits = res['f']
+    r_hits = res['r']
+    
+    for f in f_hits:
+        hit_tm_f = calculate_adjusted_tm(res['tm_f'], f['ident'])
+        if hit_tm_f < temp_val: continue # 溫度過高，引子脫落
 
-# 綁定事件
-btn_run.on_click(on_button_click)
-w_slider.observe(lambda change: update_simulation(change['new']), names='value')
+        for r in r_hits:
+            if f['id'] == r['id'] and f['str'] != r['str']:
+                hit_tm_r = calculate_adjusted_tm(res['tm_r'], r['ident'])
+                if hit_tm_r < temp_val: continue # 溫度過高，引子脫落
+                
+                dist = abs(r['s'] - f['s']) + 1
+                if 50 < dist < 5000:
+                    if not any(p['size'] == dist for p in products):
+                        products.append({
+                            'size': dist, 
+                            'gene': f['t'],
+                            'f_ident': f['ident'], 
+                            'r_ident': r['ident']
+                        })
+    
+    products.sort(key=lambda x: x['size'])
+    
+    # --- 顯示結果 ---
+    col_res, col_img = st.columns([1, 2])
+    
+    with col_res:
+        st.markdown(f"**模擬結果: 發現 {len(products)} 條產物**")
+        if not products:
+            st.warning("❄️ 此溫度下無產物 (引子無法結合)")
+        else:
+            # 找出主要產物給建議
+            target = products[0]
+            if target['f_ident'] == 100 and target['r_ident'] == 100:
+                st.success(f"✅ 主要產物: {target['size']} bp")
+                enz_name, ann, ext = calculate_pcr_conditions(target['size'], res['tm_f'], res['tm_r'], enzyme)
+                st.info(f"🧪 **建議條件 ({enz_name})**\n\n"
+                        f"- Anneal: {ann:.1f}°C\n"
+                        f"- Extension: {ext}s")
+            else:
+                st.warning("⚠️ 主要產物似乎非完美結合")
 
-# 組合介面
-ui = widgets.VBox([
-    widgets.HTML("<h3>🧬 PCR 戰情室 (v9.0 動態熱模擬版)</h3>"),
-    widgets.HBox([w_org, w_db]),
-    widgets.HBox([w_fwd, w_rev]),
-    btn_run,
-    w_progress,
-    log_output,
-    widgets.HTML("<hr><h4>🎛️ 溫度模擬實驗室</h4>"),
-    w_slider,
-    sim_output
-])
+            # 列出所有產物
+            with st.expander("查看詳細產物列表", expanded=True):
+                for p in products:
+                    icon = "✅" if (p['f_ident']==100 and p['r_ident']==100) else "⚠️"
+                    st.write(f"{icon} **{p['size']} bp** - {p['gene'][:30]}...")
 
-display(ui)
+    with col_img:
+        if products:
+            fig = draw_gel_plot(products, temp_val, organism)
+            st.pyplot(fig)
