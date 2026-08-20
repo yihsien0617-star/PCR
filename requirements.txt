@@ -1,4 +1,6 @@
-streamlit
-matplotlib
-numpy
-biopython
+streamlit>=1.32,<2
+biopython>=1.81
+matplotlib>=3.7
+numpy>=1.24
+pandas>=2.0
+ 
