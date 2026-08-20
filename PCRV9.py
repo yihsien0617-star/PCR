@@ -1,108 +1,116 @@
-# @title 🧬 PCR 戰情室 (v9.2 — Mg²⁺ 未知模式)
-# =============================================================================
-#  v9.1 -> v9.2
-#  商業 master mix 幾乎都不公開 Mg²⁺ 濃度，所以 Mg²⁺ 改為三種模式：
-#    A. 已知濃度      —— 直接輸入（自行配製 buffer 時用）
-#    B. 未知：區間估計 —— 給一個合理範圍，Tm / Ta 以「區間」呈現
-#    C. 未知：反推     —— 輸入一組實驗上跑得乾淨的 Ta，反解有效 Mg²⁺
-#  另附 Mg²⁺ 敏感度表，讓你一眼看出這個未知數到底影響多大。
-#
-#  v9.0 -> v9.1 的修正仍全部保留（Tm 熱力學、identity 分母、amplicon 座標、
-#  3' 端朝向與延伸規則、F-F/R-R 配對、widget 重複綁定…）
-# =============================================================================
+"""
+🧬 PCR 戰情室 — Streamlit 版 (v10.0)
 
-%matplotlib inline
-import ipywidgets as widgets
-from IPython.display import display, clear_output
+在 Streamlit Community Cloud 上執行：
+    1. 把本檔與 requirements.txt 一起放進 GitHub repo
+    2. Streamlit Cloud 的 Main file path 填 streamlit_app.py
+
+與 Colab/ipywidgets 版的差異
+    - 移除 %matplotlib inline（Jupyter magic，不是合法 Python 語法）
+    - 移除 ipywidgets，改用原生 Streamlit 元件
+    - 移除背景執行緒；BLAST 改用 st.cache_data 快取，只有第一次要等
+    - 反應條件改以 frozen dataclass 傳遞，不再依賴全域 widget
+
+科學計算的修正全部保留：
+    - Tm：SantaLucia & Hicks 2004 (DNA_NN4) + Owczarzy 2008 鹽校正 (saltcorr=7)
+    - 錯配 Tm：由 BLAST 比對字串以 IMM/TMM/DE 熱力學表直接計算
+    - identity 分母 = 引子全長（不是 HSP 長度）
+    - amplicon 長度 = 兩條引子 5' 端距離（HSP 截斷時會外推）
+    - 3' 端朝向檢查 + 3' 末端錯配封鎖
+    - F-F / R-R 自我配對
+"""
+
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass, replace
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import threading
+import pandas as pd
+import streamlit as st
 
-try:
-    from Bio.Blast import NCBIWWW, NCBIXML
-    from Bio.SeqUtils import MeltingTemp as mt
-    from Bio.Seq import Seq
-except ImportError:
-    raise SystemExit("⚠️ 請先安裝 Biopython：pip install biopython")
+from Bio.Blast import NCBIWWW, NCBIXML
+from Bio.Seq import Seq
+from Bio.SeqUtils import MeltingTemp as mt
 
-# ================= 全域狀態 =================
-raw_blast_data = {"f": [], "r": []}
-primer_info = {"tm_f": None, "tm_r": None, "seq_f": "", "seq_r": "", "ta": None}
-_busy = threading.Lock()
+st.set_page_config(page_title="PCR 戰情室", page_icon="🧬", layout="wide")
+
+MIN_PRODUCT, MAX_PRODUCT = 50, 5000
+THREE_PRIME_CRITICAL = 2      # 3' 末 2 nt 錯配 -> 幾乎不延伸
+THREE_PRIME_WINDOW = 5        # 3' 末 5 nt 內的錯配額外註記
 
 
 # =============================================================================
-#  1. Mg²⁺ 模式
+#  反應條件
 # =============================================================================
 
-def mg_bounds():
-    """回傳 (下限, 代表值, 上限)。三種模式共用的單一入口。"""
-    mode = w_mg_mode.value
-    if mode == "known":
-        v = float(w_mg.value)
-        return v, v, v
-    if mode == "solve":
-        v = float(w_mg_solved.value)
-        return v, v, v
-    lo, hi = float(w_mg_lo.value), float(w_mg_hi.value)
-    if lo > hi:
-        lo, hi = hi, lo
-    return lo, (lo + hi) / 2.0, hi
+@dataclass(frozen=True)
+class Cond:
+    """PCR 反應條件。frozen 才能當 st.cache_data 的 key。"""
+    mg: float = 1.5           # mM
+    dntp: float = 0.2         # mM (each)
+    mono: float = 50.0        # mM K+
+    tris: float = 10.0        # mM
+    primer_nM: float = 200.0  # nM
+    offset: float = 0.0       # °C 校正
+
+    def key(self):
+        return (self.mg, self.dntp, self.mono, self.tris,
+                self.primer_nM, self.offset)
+
+    def label(self):
+        return (f"{self.mono:g} mM K⁺ / {self.tris:g} mM Tris / "
+                f"{self.mg:.2f} mM Mg²⁺ / {self.dntp:g} mM dNTP / "
+                f"{self.primer_nM:g} nM primer / offset {self.offset:+.1f}°C")
 
 
-def effective_mg():
-    """點估計時使用的 Mg²⁺（區間模式取中點）。"""
-    return mg_bounds()[1]
+def nn_kwargs(cond: Cond) -> dict:
+    """Bio.SeqUtils.MeltingTemp 的參數。
 
-
-def nn_kwargs(mg=None):
-    """Bio.SeqUtils.MeltingTemp 參數。
-
-    saltcorr=7 (Owczarzy 2008) 是 Biopython 中唯一同時正確處理
-    Mg²⁺ 與 dNTP 螯合的鹽校正法。注意：當 Mg <= dNTP 時公式會退回
-    只算一價鹽，所以 Mg 在 0 ~ dNTP 之間 Tm 不會變動。
+    saltcorr=7 (Owczarzy 2008) 是 Biopython 中唯一同時正確處理 Mg²⁺ 與
+    dNTP 螯合的鹽校正法。用預設的 saltcorr=5 / Mg=0 會系統性低估 Tm 約 6-8°C。
+    注意：Mg <= dNTP 時公式退回只算一價鹽，所以該區間 Tm 不隨 Mg 變動。
     """
     return dict(
-        dnac1=float(w_primer_nM.value),
-        dnac2=0.0,
-        selfcomp=False,
-        Na=0.0,
-        K=float(w_mono.value),
-        Tris=float(w_tris.value),
-        Mg=float(effective_mg() if mg is None else mg),
-        dNTPs=float(w_dntp.value),
+        dnac1=cond.primer_nM, dnac2=0.0, selfcomp=False,
+        Na=0.0, K=cond.mono, Tris=cond.tris,
+        Mg=cond.mg, dNTPs=cond.dntp,
         nn_table=mt.DNA_NN4,
         tmm_table=mt.DNA_TMM1,
         imm_table=mt.DNA_IMM1,
         de_table=mt.DNA_DE1,
-        saltcorr=7,
-        strict=False,
+        saltcorr=7, strict=False,
     )
 
 
 # =============================================================================
-#  2. 熱力學核心
+#  熱力學
 # =============================================================================
 
-def tm_perfect(seq, mg=None):
-    seq = seq.strip().upper().replace(" ", "")
-    if not seq:
+def clean_seq(s: str) -> str:
+    return "".join(ch for ch in s.upper() if not ch.isspace())
+
+
+def valid_seq(s: str) -> bool:
+    return bool(s) and set(s) <= set("ATGC")
+
+
+def tm_perfect(seq: str, cond: Cond):
+    seq = clean_seq(seq)
+    if not valid_seq(seq):
         return None
-    return mt.Tm_NN(Seq(seq), **nn_kwargs(mg)) + float(w_offset.value)
+    return mt.Tm_NN(Seq(seq), **nn_kwargs(cond)) + cond.offset
 
 
-def tm_span(seq):
-    """回傳 (下限, 代表值, 上限) 的 Tm。非區間模式時三者相同。"""
-    lo, mid, hi = mg_bounds()
-    return (tm_perfect(seq, lo), tm_perfect(seq, mid), tm_perfect(seq, hi))
-
-
-def tm_duplex(query_aln, sbjct_aln, mg=None):
-    """由 BLAST 比對字串直接算含錯配的真實雙股 Tm。
+def tm_duplex(query_aln: str, sbjct_aln: str, cond: Cond):
+    """由 BLAST 比對字串算含錯配的真實雙股 Tm。
 
     BLAST 的 hsp.query / hsp.sbjct 是「同義股」對齊（字母相同 = match），
     引子實際結合的是 sbjct 的『互補』股，左到右恰為 3'->5'，
-    正是 Biopython c_seq 要求的方向。
+    正是 Biopython c_seq 參數要求的方向。
     """
     q, s = query_aln.upper(), sbjct_aln.upper()
     if len(q) != len(s):
@@ -110,17 +118,16 @@ def tm_duplex(query_aln, sbjct_aln, mg=None):
 
     if "-" in q or "-" in s:
         # 含 indel：Tm_NN 不支援，退回保守經驗式
-        ident = sum(1 for a, b in zip(q, s) if a == b and a != "-")
-        base = tm_perfect(q.replace("-", ""), mg)
+        bare = q.replace("-", "")
+        base = tm_perfect(bare, cond)
         if base is None:
             return None, "gap-fallback"
-        n = max(len(q.replace("-", "")), 1)
-        return base - (1 - ident / n) * 100 * 1.2, "gap-fallback"
+        ident = sum(1 for a, b in zip(q, s) if a == b and a != "-")
+        return base - (1 - ident / max(len(bare), 1)) * 100 * 1.2, "gap-fallback"
 
     try:
-        c = str(Seq(s).complement())
-        return mt.Tm_NN(Seq(q), c_seq=Seq(c), **nn_kwargs(mg)) \
-               + float(w_offset.value), "NN-mismatch"
+        c = str(Seq(s).complement())          # 3'->5' 的模板股
+        return mt.Tm_NN(Seq(q), c_seq=Seq(c), **nn_kwargs(cond)) + cond.offset, "NN"
     except Exception:
         return None, "nn-failed"
 
@@ -132,31 +139,30 @@ def recommend_ta(tm_f, tm_r):
     return min(min(tm_f, tm_r) - 5.0, 72.0)
 
 
-def solve_mg(target_ta, f_seq, r_seq):
+def solve_mg(target_ta: float, f_seq: str, r_seq: str, cond: Cond):
     """由「實驗上跑得乾淨的 Ta」反解有效 Mg²⁺（二分法）。
 
-    Tm 對 Mg²⁺ 在 Mg > dNTP 的區間內單調遞增，所以二分法收斂。
-    搜尋下界刻意設在 dNTP+0.3 以避開 Owczarzy 公式的分支切換點。
-    回傳 (mg, 說明字串)；無解時 mg 為 None。
+    Tm 對 Mg²⁺ 在 Mg > dNTP 的區間內單調遞增，故二分法收斂。
+    下界設在 dNTP+0.3 以避開 Owczarzy 公式的分支切換點。
+    回傳 (mg 或 None, 說明字串)。
     """
-    target_tm = target_ta + 5.0          # 反推 recommend_ta
+    target_tm = target_ta + 5.0
 
     def limiting_tm(mg):
-        a, b = tm_perfect(f_seq, mg), tm_perfect(r_seq, mg)
-        return min(a, b)
+        c = replace(cond, mg=mg)
+        return min(tm_perfect(f_seq, c), tm_perfect(r_seq, c))
 
-    lo = float(w_dntp.value) + 0.3
-    hi = 10.0
+    lo, hi = cond.dntp + 0.3, 10.0
     f_lo, f_hi = limiting_tm(lo), limiting_tm(hi)
 
     if target_tm < f_lo:
-        return None, (f"實驗 Ta 偏低：即使 Mg²⁺ 只有 {lo:.1f} mM，"
-                      f"限速引子 Tm 仍有 {f_lo:.1f}°C（對應 Ta {f_lo-5:.1f}°C）。"
-                      f"差額請用 offset 補（建議 offset = {target_tm - f_lo:+.1f}°C）。")
+        return None, (f"實驗 Ta 偏低：即使 Mg²⁺ 只有 {lo:.1f} mM，限速引子 Tm 仍有 "
+                      f"{f_lo:.1f}°C（對應 Ta {f_lo-5:.1f}°C）。"
+                      f"差額請改用 offset = {target_tm - f_lo:+.1f}°C 補。")
     if target_tm > f_hi:
-        return None, (f"實驗 Ta 偏高：即使 Mg²⁺ 拉到 {hi:.0f} mM，"
-                      f"限速引子 Tm 只有 {f_hi:.1f}°C（對應 Ta {f_hi-5:.1f}°C）。"
-                      f"差額請用 offset 補（建議 offset = {target_tm - f_hi:+.1f}°C）。")
+        return None, (f"實驗 Ta 偏高：即使 Mg²⁺ 拉到 {hi:.0f} mM，限速引子 Tm 只有 "
+                      f"{f_hi:.1f}°C（對應 Ta {f_hi-5:.1f}°C）。"
+                      f"差額請改用 offset = {target_tm - f_hi:+.1f}°C 補。")
 
     for _ in range(60):
         mid = (lo + hi) / 2.0
@@ -165,91 +171,105 @@ def solve_mg(target_ta, f_seq, r_seq):
         else:
             hi = mid
     mg = (lo + hi) / 2.0
-    return mg, (f"有效 Mg²⁺ ≈ {mg:.2f} mM"
-                + ("　（合理範圍內 ✔）" if 0.8 <= mg <= 4.0 else
-                   "　⚠️ 超出一般 master mix 範圍，可能是其他因素（酶種類、"
-                   "增強劑、引子純度）造成，建議改用 offset 校正"))
+    ok = 0.8 <= mg <= 4.0
+    note = ("（落在一般 master mix 範圍內 ✔）" if ok else
+            "（⚠️ 超出一般 master mix 的合理範圍，差異來源可能不是 Mg²⁺，"
+            "而是酶種類、master mix 內的增強劑或引子純度；建議改用 offset 校正）")
+    return mg, f"有效 Mg²⁺ ≈ **{mg:.2f} mM** {note}"
 
 
 # =============================================================================
-#  3. 3' 端規則
+#  3' 端規則
 # =============================================================================
 
-THREE_PRIME_CRITICAL = 2   # 末 2 nt 錯配 -> 幾乎完全不延伸
-THREE_PRIME_WINDOW = 5     # 末 5 nt 內的錯配額外註記
-
-
-def three_prime_status(query_aln, sbjct_aln, q_end, plen):
-    """q_end < plen 代表 HSP 沒蓋到引子 3' 端 —— BLAST 會在錯配處截斷比對，
-    所以這通常就是「3' 端錯配」，必須視為不可延伸。"""
+def three_prime_status(q_aln: str, s_aln: str, q_end: int, plen: int):
+    """BLAST 會在錯配處截斷比對，所以 q_end < plen 通常就代表 3' 端錯配。"""
     if q_end < plen:
-        return False, f"3'端未比對到 (缺 {plen - q_end} nt)"
+        return False, f"3'端未比對到（缺 {plen - q_end} nt）"
 
-    q, s = query_aln.upper(), sbjct_aln.upper()
-    tq, ts = q[-THREE_PRIME_WINDOW:], s[-THREE_PRIME_WINDOW:]
+    tq, ts = q_aln.upper()[-THREE_PRIME_WINDOW:], s_aln.upper()[-THREE_PRIME_WINDOW:]
     mism = [i for i, (a, b) in enumerate(zip(tq, ts)) if a != b]
     if not mism:
         return True, "3'端完全配對"
-    dist = [len(tq) - 1 - i for i in mism]     # 0 = 最末鹼基
-    if min(dist) < THREE_PRIME_CRITICAL:
-        return False, f"3'末端第 {min(dist)+1} 位錯配 → 無法延伸"
-    return True, f"3'端 -{min(dist)+1} 位錯配 (效率下降)"
+    dist = min(len(tq) - 1 - i for i in mism)     # 0 = 最末鹼基
+    if dist < THREE_PRIME_CRITICAL:
+        return False, f"3'末端第 {dist+1} 位錯配 → 無法延伸"
+    return True, f"3'端 -{dist+1} 位錯配（效率下降）"
 
 
 # =============================================================================
-#  4. BLAST 解析
+#  BLAST（快取）
 # =============================================================================
 
-def parse_hits(record, primer_seq, tag):
-    plen = len(primer_seq)
+@st.cache_data(show_spinner=False, ttl=24 * 3600, max_entries=64)
+def blast_xml(seq: str, organism: str, database: str) -> str:
+    """向 NCBI 查詢並回傳 XML 字串。
+
+    快取 key = (seq, organism, database)，所以調整溫度滑桿或反應條件
+    都不會重新查詢——只有換引子/物種/資料庫才會重跑。
+    """
+    handle = NCBIWWW.qblast(
+        "blastn", database, seq,
+        entrez_query=f'"{organism}"[Organism]',
+        expect=1000, word_size=7,
+        hitlist_size=500, megablast=False,
+    )
+    try:
+        return handle.read()
+    finally:
+        handle.close()
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def parse_hits(xml: str, primer: str, tag: str, cond_key: tuple) -> list:
+    """解析 XML 並算好每個結合位點的 Tm。"""
+    cond = Cond(*cond_key)
+    plen = len(primer)
+    record = NCBIXML.read(io.StringIO(xml))
+
     hits = []
     for a in record.alignments:
         for h in a.hsps:
             s_start, s_end = h.sbjct_start, h.sbjct_end
-            strand = 1 if s_end >= s_start else -1      # 負股 hit-from > hit-to
+            strand = 1 if s_end >= s_start else -1    # 負股 hit-from > hit-to
 
-            ident_full = h.identities / plen * 100.0    # 分母必須是引子全長
+            ident = h.identities / plen * 100.0       # 分母必須是引子全長
             coverage = h.align_length / plen * 100.0
 
             # 把 HSP 外推到引子兩端（比對欄位左到右 = query 5'->3'）
             five_prime = s_start - strand * (h.query_start - 1)
             three_prime = s_end + strand * (plen - h.query_end)
 
-            tm, method = tm_duplex(h.query, h.sbjct)
+            tm, method = tm_duplex(h.query, h.sbjct, cond)
             ext_ok, ext_note = three_prime_status(h.query, h.sbjct,
                                                   h.query_end, plen)
             hits.append({
                 "tag": tag, "id": a.accession, "title": a.title,
-                "aln": (h.query, h.sbjct),
                 "strand": strand,
                 "five_prime": five_prime, "three_prime": three_prime,
-                "ident": ident_full, "coverage": coverage,
+                "ident": ident, "coverage": coverage,
                 "tm": tm, "tm_method": method,
                 "ext_ok": ext_ok, "ext_note": ext_note,
-                "perfect": (ident_full >= 99.99 and coverage >= 99.99),
+                "perfect": ident >= 99.99 and coverage >= 99.99,
             })
     return hits
 
 
 # =============================================================================
-#  5. 產物模擬
+#  產物模擬
 # =============================================================================
 
-MIN_PRODUCT, MAX_PRODUCT = 50, 5000
-
-
-def pair_products(hits_a, hits_b, temp, allow_self=True):
+def pair_products(hits_f, hits_r, temp: float, allow_self: bool = True):
     """擴增條件：同一條序列、一正一負股、兩條 3' 端『面對面』、
     且在該溫度下都還結合著且 3' 端可延伸。
     amplicon 長度 = 兩條引子 5' 端之間的距離。"""
     def alive(h):
         return h["ext_ok"] and h["tm"] is not None and h["tm"] >= temp
 
-    live = [h for h in hits_a if alive(h)] + [h for h in hits_b if alive(h)]
-
     by_acc = {}
-    for h in live:
-        by_acc.setdefault(h["id"], []).append(h)
+    for h in list(hits_f) + list(hits_r):
+        if alive(h):
+            by_acc.setdefault(h["id"], []).append(h)
 
     products, seen = [], set()
     for acc, group in by_acc.items():
@@ -260,7 +280,7 @@ def pair_products(hits_a, hits_b, temp, allow_self=True):
                 if not allow_self and plus["tag"] == minus["tag"]:
                     continue
                 if plus["three_prime"] >= minus["three_prime"]:
-                    continue                      # 3' 端背對背 -> 不擴增
+                    continue                       # 3' 端背對背 → 不擴增
                 size = minus["five_prime"] - plus["five_prime"] + 1
                 if not (MIN_PRODUCT <= size <= MAX_PRODUCT):
                     continue
@@ -271,30 +291,29 @@ def pair_products(hits_a, hits_b, temp, allow_self=True):
                 products.append({
                     "size": size, "id": acc, "title": plus["title"],
                     "pair": f"{plus['tag']}/{minus['tag']}",
-                    "f_ident": plus["ident"], "r_ident": minus["ident"],
                     "f_tm": plus["tm"], "r_tm": minus["tm"],
+                    "f_ident": plus["ident"], "r_ident": minus["ident"],
                     "perfect": plus["perfect"] and minus["perfect"]
                                and plus["tag"] != minus["tag"],
                     "margin": min(plus["tm"], minus["tm"]) - temp,
                 })
-    products.sort(key=lambda p: (-p["perfect"], p["size"]))
+    products.sort(key=lambda p: (not p["perfect"], p["size"]))
     return products
 
 
 # =============================================================================
-#  6. 繪圖
+#  電泳圖
 # =============================================================================
 
-def draw_gel(products, temp, organism):
-    plt.close("all")
-    fig, ax = plt.subplots(figsize=(9, 5.5), dpi=100)
-    fig.patch.set_facecolor("#111111")
+def draw_gel(products, temp: float, organism: str):
+    fig, ax = plt.subplots(figsize=(7.5, 5.2), dpi=130)
+    fig.patch.set_facecolor("#0E1117")
     ax.set_facecolor("black")
 
-    for b in [100, 200, 300, 400, 500, 600, 800, 1000, 1500, 2000, 3000, 5000]:
+    for b in (100, 200, 300, 400, 500, 600, 800, 1000, 1500, 2000, 3000, 5000):
         y = -np.log10(b)
-        ax.hlines(y, 0.5, 1.5, colors="white", alpha=0.45, linewidth=1.5)
-        ax.text(0.35, y, f"{b}", color="white", fontsize=7, va="center", ha="right")
+        ax.hlines(y, 0.5, 1.5, colors="white", alpha=0.45, linewidth=1.4)
+        ax.text(0.38, y, f"{b}", color="white", fontsize=6.5, va="center", ha="right")
 
     order = sorted(range(len(products)),
                    key=lambda i: (not products[i]["perfect"], -products[i]["margin"]))
@@ -306,335 +325,243 @@ def draw_gel(products, temp, organism):
             color, alpha, lw, tag = "#00FF41", 1.0, 4.0, "Target"
         else:
             alpha = float(np.clip(0.25 + p["margin"] / 20.0, 0.2, 0.85))
-            color, lw, tag = "#FFD400", 2.0, f"Non-specific {p['pair']}"
-        ax.hlines(y, 2.5, 3.6, colors=color, alpha=alpha, linewidth=lw)
+            color, lw, tag = "#FFD400", 2.0, f"Non-spec {p['pair']}"
+        ax.hlines(y, 2.4, 3.5, colors=color, alpha=alpha, linewidth=lw)
         if labelled < 6:
-            ax.text(3.75, y, f"{p['size']} bp  ({tag})", color=color,
-                    fontsize=8.5, va="center", alpha=max(alpha, 0.7))
+            ax.text(3.65, y, f"{p['size']} bp ({tag})", color=color,
+                    fontsize=7.5, va="center", alpha=max(alpha, 0.7))
             labelled += 1
 
-    ax.set_xlim(0, 6.6)
+    ax.set_xlim(0, 6.4)
     ax.set_ylim(-np.log10(MAX_PRODUCT * 1.15), -np.log10(MIN_PRODUCT * 0.85))
-    ax.set_xticks([1, 3.05])
-    ax.set_xticklabels(["Marker", f"PCR @ {temp:.1f}°C"], color="white")
+    ax.set_xticks([1, 2.95])
+    ax.set_xticklabels(["Marker", f"PCR @ {temp:.1f}°C"], color="white", fontsize=8)
     ax.tick_params(colors="white")
     ax.set_yticks([])
     for sp in ax.spines.values():
-        sp.set_color("#444444")
-    ax.set_title(f"In-Silico PCR  ({organism})", color="white", fontsize=11)
+        sp.set_color("#333333")
+    ax.set_title(f"In-Silico PCR  ({organism})", color="white", fontsize=10)
     fig.tight_layout()
-    display(fig)
-    plt.close(fig)
+    return fig
 
 
 # =============================================================================
-#  7. 模擬 / Tm 面板
+#  側邊欄：反應條件
 # =============================================================================
+
+st.sidebar.header("🧪 反應條件")
+
+mg_mode = st.sidebar.radio(
+    "Mg²⁺ 濃度",
+    ["① 已知濃度", "② 未知 → 區間估計", "③ 未知 → 由實驗 Ta 反推"],
+    index=1,
+    help="市售 master mix 幾乎都不公開 Mg²⁺ 濃度，預設用區間估計。",
+)
+
+mg_lo = mg_hi = None
+if mg_mode.startswith("①"):
+    mg_point = st.sidebar.number_input("Mg²⁺ (mM)", 0.0, 10.0, 1.5, 0.1)
+elif mg_mode.startswith("②"):
+    c1, c2 = st.sidebar.columns(2)
+    mg_lo = c1.number_input("下限 (mM)", 0.0, 10.0, 1.0, 0.1)
+    mg_hi = c2.number_input("上限 (mM)", 0.0, 10.0, 3.0, 0.1)
+    if mg_lo > mg_hi:
+        mg_lo, mg_hi = mg_hi, mg_lo
+    mg_point = (mg_lo + mg_hi) / 2.0
+    st.sidebar.caption("2X Taq master mix 稀釋成 1X 後，Mg²⁺ 多落在 1.5–2.5 mM；"
+                       "1.0–3.0 是保守涵蓋範圍。Tm 與 Ta 會以區間顯示。")
+else:
+    mg_point = st.session_state.get("mg_solved", 1.5)
+    st.sidebar.metric("目前採用的有效 Mg²⁺", f"{mg_point:.2f} mM")
+    st.sidebar.caption("在下方「Mg²⁺ 反推」區塊輸入一組實測 Ta 即可求解。")
+
+st.sidebar.divider()
+c1, c2 = st.sidebar.columns(2)
+dntp = c1.number_input("dNTP each (mM)", 0.0, 2.0, 0.2, 0.05)
+mono = c2.number_input("K⁺ (mM)", 0.0, 200.0, 50.0, 5.0)
+c3, c4 = st.sidebar.columns(2)
+tris = c3.number_input("Tris (mM)", 0.0, 100.0, 10.0, 1.0)
+primer_nM = c4.number_input("Primer (nM)", 10.0, 2000.0, 200.0, 10.0)
+offset = st.sidebar.number_input(
+    "校正 offset (°C)", -15.0, 15.0, 0.0, 0.5,
+    help="模型與實驗的系統性差異。用一組已知可行的 Ta 校正後，其他引子就會準。")
+
+cond = Cond(mg=mg_point, dntp=dntp, mono=mono, tris=tris,
+            primer_nM=primer_nM, offset=offset)
+
+st.sidebar.divider()
+organism = st.sidebar.selectbox("物種", ["Homo sapiens", "Mus musculus"],
+                                format_func=lambda x: {"Homo sapiens": "人類 (Homo sapiens)",
+                                                       "Mus musculus": "小鼠 (Mus musculus)"}[x])
+database = st.sidebar.selectbox("資料庫", ["refseq_rna", "nt"],
+                                format_func=lambda x: {"refseq_rna": "mRNA (refseq_rna)",
+                                                       "nt": "Genomic (nt)"}[x])
+
+
+# =============================================================================
+#  主畫面
+# =============================================================================
+
+st.title("🧬 PCR 戰情室")
+st.caption("In-silico PCR ・ 熱力學 Tm ・ 非專一性產物模擬　|　"
+           "Tm 模型：SantaLucia & Hicks 2004 + Owczarzy 2008 鹽校正")
+
+c1, c2 = st.columns(2)
+f_seq = clean_seq(c1.text_input("Forward primer (5'→3')",
+                                "AGGTCAAAGAGGCTGCTTGG"))
+r_seq = clean_seq(c2.text_input("Reverse primer (5'→3')",
+                                "AACTGCATGGAATTGGTTGAC"))
+
+bad = [n for n, s in (("Forward", f_seq), ("Reverse", r_seq)) if s and not valid_seq(s)]
+if bad:
+    st.error(f"{'、'.join(bad)} 含有 A/T/G/C 以外的字元，無法計算 Tm。")
+    st.stop()
+if not (f_seq and r_seq):
+    st.info("請輸入兩條引子序列。")
+    st.stop()
+
+
+# ---------- Tm 面板 ----------
+st.subheader("🌡️ Tm 與建議 Annealing 溫度")
+
+tm_f = tm_perfect(f_seq, cond)
+tm_r = tm_perfect(r_seq, cond)
+ta = recommend_ta(tm_f, tm_r)
+
 
 def gc_pct(s):
-    s = s.upper()
     return 100.0 * (s.count("G") + s.count("C")) / max(len(s), 1)
 
 
-def _cond_line():
-    lo, mid, hi = mg_bounds()
-    mg_txt = f"{mid:.2f} mM" if lo == hi else f"{lo:.1f}–{hi:.1f} mM (取中點 {mid:.2f})"
-    return (f"{w_mono.value:g} mM K⁺ / {w_tris.value:g} mM Tris / Mg²⁺ {mg_txt} / "
-            f"{w_dntp.value:g} mM dNTP / {w_primer_nM.value:g} nM primer"
-            f"  (offset {w_offset.value:+.1f}°C)")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Forward Tm", f"{tm_f:.1f} °C", f"{len(f_seq)} nt ・ GC {gc_pct(f_seq):.0f}%",
+          delta_color="off")
+m2.metric("Reverse Tm", f"{tm_r:.1f} °C", f"{len(r_seq)} nt ・ GC {gc_pct(r_seq):.0f}%",
+          delta_color="off")
+m3.metric("ΔTm", f"{abs(tm_f - tm_r):.1f} °C",
+          "✔ 平衡" if abs(tm_f - tm_r) <= 5 else "⚠️ >5°C 建議重新設計",
+          delta_color="off")
+m4.metric("建議 Ta", f"{ta:.1f} °C", "Taq 慣例 Tm−5", delta_color="off")
 
+if mg_lo is not None:
+    lo_c, hi_c = replace(cond, mg=mg_lo), replace(cond, mg=mg_hi)
+    ta_lo = recommend_ta(tm_perfect(f_seq, lo_c), tm_perfect(r_seq, lo_c))
+    ta_hi = recommend_ta(tm_perfect(f_seq, hi_c), tm_perfect(r_seq, hi_c))
+    st.info(f"**Mg²⁺ 不確定性** — Mg²⁺ 取 {mg_lo:.1f}–{mg_hi:.1f} mM 時，"
+            f"建議 Ta 落在 **{ta_lo:.1f} – {ta_hi:.1f} °C**"
+            f"（寬度僅 {ta_hi - ta_lo:.1f}°C）。"
+            f"相較之下，若誤設 Mg²⁺ = 0 會低估約 10°C——"
+            f"不知道 Mg²⁺ 是小問題，假設它是 0 才是大問題。")
 
-def update_simulation(temp=None):
-    if temp is None:
-        temp = w_slider.value
-    temp = float(temp)
+st.caption(f"條件：{cond.label()}")
 
-    with sim_output:
-        clear_output(wait=True)
-        f_hits, r_hits = raw_blast_data["f"], raw_blast_data["r"]
-        if not f_hits and not r_hits:
-            print("尚無 BLAST 資料，請先按上方按鈕取得引子結合位點。")
-            return
+with st.expander("📉 Mg²⁺ 敏感度表"):
+    rows = []
+    for m in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0):
+        cm = replace(cond, mg=m)
+        a, b = tm_perfect(f_seq, cm), tm_perfect(r_seq, cm)
+        rows.append({"Mg²⁺ (mM)": m, "Tm-F (°C)": round(a, 1),
+                     "Tm-R (°C)": round(b, 1),
+                     "建議 Ta (°C)": round(recommend_ta(a, b), 1)})
+    st.dataframe(pd.DataFrame(rows), hide_index=True)
+    st.caption("Mg²⁺ 的效應會飽和：0.5→1.5 掉 3.5°C，但 2.5→4.0 只差 0.8°C。")
 
-        products = pair_products(f_hits, r_hits, temp, allow_self=w_selfpair.value)
-        tm_f, tm_r, ta = primer_info["tm_f"], primer_info["tm_r"], primer_info["ta"]
-
-        print(f"🌡️  設定 Ta = {temp:.1f}°C" + (f"   (建議值 {ta:.1f}°C)" if ta else ""))
-        if tm_f and tm_r:
-            print(f"    完美結合 Tm：F = {tm_f:.1f}°C，R = {tm_r:.1f}°C")
-        print(f"    條件：{_cond_line()}")
-        print("-" * 72)
-
-        if not products:
-            print("❄️  此溫度下無任何產物 —— 引子已脫落或 3' 端無法延伸。")
-            return
-
-        n_t = sum(1 for p in products if p["perfect"])
-        print(f"📊 共 {len(products)} 條產物"
-              f"（{n_t} 條完美配對，{len(products)-n_t} 條非專一性）")
-        for p in products[:15]:
-            mark = "✅ Target" if p["perfect"] else f"⚠️  非專一 {p['pair']}"
-            print(f"   {p['size']:>5} bp  {mark}"
-                  f"   Tm(F/R)={p['f_tm']:.1f}/{p['r_tm']:.1f}"
-                  f"   餘裕 +{p['margin']:.1f}°C")
-            print(f"          {p['id']}  {p['title'][:58]}")
-        if len(products) > 15:
-            print(f"   ... 另有 {len(products)-15} 條未列出")
-
-        draw_gel(products, temp, w_org.value)
-
-
-def refresh_tm_panel(*_):
-    """引子或反應條件改變時重算 Tm。不需要重跑 BLAST。"""
-    f, r = w_fwd.value.strip().upper(), w_rev.value.strip().upper()
-    with tm_output:
-        clear_output(wait=True)
-        if not f or not r:
-            print("填入兩條引子後，這裡會即時顯示 Tm 與建議 Ta。")
-            return
-        try:
-            f_lo, f_mid, f_hi = tm_span(f)
-            r_lo, r_mid, r_hi = tm_span(r)
-        except Exception as e:
-            print(f"⚠️ 序列無法計算 Tm（只接受 A/T/G/C）：{e}")
-            return
-
-        ta = recommend_ta(f_mid, r_mid)
-        primer_info.update(tm_f=f_mid, tm_r=r_mid, seq_f=f, seq_r=r, ta=ta)
-        ranged = (f_lo != f_hi)
-
-        def fmt(lo, mid, hi):
-            return f"{mid:5.1f}°C" + (f"  [{lo:.1f} – {hi:.1f}]" if ranged else "")
-
-        print(f"Forward  {len(f):2d} nt  GC {gc_pct(f):4.1f}%   Tm = {fmt(f_lo,f_mid,f_hi)}")
-        print(f"Reverse  {len(r):2d} nt  GC {gc_pct(r):4.1f}%   Tm = {fmt(r_lo,r_mid,r_hi)}")
-        dtm = abs(f_mid - r_mid)
-        print(f"ΔTm = {dtm:.1f}°C" +
-              ("   ⚠️ 相差 >5°C，建議重新設計" if dtm > 5 else "   ✔"))
-
-        if ranged:
-            ta_lo = recommend_ta(f_lo, r_lo)
-            ta_hi = recommend_ta(f_hi, r_hi)
-            print(f"👉 建議 Ta：{ta:.1f}°C　【Mg²⁺ 不確定性造成的範圍 "
-                  f"{ta_lo:.1f} – {ta_hi:.1f}°C，寬度 {ta_hi-ta_lo:.1f}°C】")
+with st.expander("🔧 Mg²⁺ 反推（用一組實測 Ta 校準整個模型）", expanded=mg_mode.startswith("③")):
+    st.write("填入一組你**實際跑過、能得到乾淨單一 band** 的 Ta，"
+             "系統會反解出符合該結果的有效 Mg²⁺。")
+    sc1, sc2 = st.columns([1, 3])
+    obs_ta = sc1.number_input("實測可行 Ta (°C)", 35.0, 75.0, 55.0, 0.5)
+    if sc2.button("反推有效 Mg²⁺"):
+        mg_sol, msg = solve_mg(obs_ta, f_seq, r_seq, cond)
+        if mg_sol is None:
+            st.warning(msg)
         else:
-            print(f"👉 建議 Ta（Taq 慣例 Tm−5）：{ta:.1f}°C")
+            st.session_state["mg_solved"] = round(mg_sol, 2)
+            st.success(msg + "　已存入，請把左側切到模式 ③ 套用。")
 
-        # ---- Mg²⁺ 敏感度表：讓「未知」這件事變得可量化 ----
-        print("\n   Mg²⁺ 敏感度（其餘條件不變）")
-        print("   Mg(mM)   Tm-F    Tm-R   建議Ta")
-        for m in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0):
-            a, b = tm_perfect(f, m), tm_perfect(r, m)
-            print(f"   {m:5.1f}  {a:6.1f}  {b:6.1f}   {recommend_ta(a,b):5.1f}"
-                  + ("   ← 目前" if abs(m - effective_mg()) < 0.26 else ""))
-
-    if raw_blast_data["f"] or raw_blast_data["r"]:
-        for key in ("f", "r"):
-            for h in raw_blast_data[key]:
-                h["tm"], h["tm_method"] = tm_duplex(*h["aln"])
-        update_simulation()
+st.divider()
 
 
-def on_solve(_):
-    f, r = w_fwd.value.strip().upper(), w_rev.value.strip().upper()
-    with solve_output:
-        clear_output(wait=True)
-        if not f or not r:
-            print("請先填入兩條引子序列。")
-            return
-        mg, msg = solve_mg(float(w_obs_ta.value), f, r)
-        print(f"實驗 Ta = {w_obs_ta.value:.1f}°C  →  {msg}")
-        if mg is not None:
-            w_mg_solved.value = round(mg, 2)
-            print("已套用。之後所有引子都會沿用這個有效 Mg²⁺。")
-    refresh_tm_panel()
+# ---------- BLAST ----------
+st.subheader("🔍 引子結合位點（NCBI BLAST）")
+
+sig = (f_seq, r_seq, organism, database)
+run = st.button("🚀 查詢 NCBI", type="primary")
+
+if run:
+    st.session_state["blast_sig"] = sig
+
+if st.session_state.get("blast_sig") != sig:
+    st.info("按上方按鈕向 NCBI 查詢。第一次約需 1–3 分鐘（NCBI 佇列），"
+            "結果會快取 24 小時——之後調整溫度或反應條件都是瞬間反應，不會重查。")
+    st.stop()
+
+try:
+    with st.status("向 NCBI 查詢中…", expanded=True) as status:
+        st.write("⏳ Forward 引子…")
+        xml_f = blast_xml(f_seq, organism, database)
+        st.write("⏳ Reverse 引子…")
+        xml_r = blast_xml(r_seq, organism, database)
+        st.write("🧮 解析比對結果並計算各位點 Tm…")
+        hits_f = parse_hits(xml_f, f_seq, "F", cond.key())
+        hits_r = parse_hits(xml_r, r_seq, "R", cond.key())
+        status.update(label=f"完成：F {len(hits_f)} 個 / R {len(hits_r)} 個結合位點",
+                      state="complete", expanded=False)
+except Exception as e:
+    st.error(f"BLAST 失敗：{type(e).__name__}: {e}\n\n"
+             "NCBI 偶爾會因流量限制拒絕連線，稍候再試。")
+    st.stop()
 
 
-def on_mg_mode(_):
-    m = w_mg_mode.value
-    box_known.layout.display = "" if m == "known" else "none"
-    box_range.layout.display = "" if m == "range" else "none"
-    box_solve.layout.display = "" if m == "solve" else "none"
-    refresh_tm_panel()
+# ---------- 溫度模擬 ----------
+st.subheader("🎛️ 溫度模擬")
 
+sl1, sl2 = st.columns([3, 1])
+temp = sl1.slider("Annealing 溫度 Ta (°C)", 35.0, 78.0,
+                  float(np.clip(round(ta * 2) / 2, 35.0, 78.0)), 0.5)
+allow_self = sl2.checkbox("計入 F-F / R-R 產物", value=True,
+                          help="同一條引子分別落在正負股時也會產生真實的非專一性條帶。")
 
-# =============================================================================
-#  8. BLAST 執行緒
-# =============================================================================
+products = pair_products(hits_f, hits_r, temp, allow_self)
 
-def run_blast_thread(f_seq, r_seq, organism, database):
-    if not _busy.acquire(blocking=False):
-        return
-    try:
-        with log_output:
-            clear_output(wait=True)
-            try:
-                w_progress.value, w_progress.bar_style = 5, "info"
-                f_seq, r_seq = f_seq.strip().upper(), r_seq.strip().upper()
+left, right = st.columns([3, 2])
 
-                tm_f, tm_r = tm_perfect(f_seq), tm_perfect(r_seq)
-                ta = recommend_ta(tm_f, tm_r)
-                primer_info.update(tm_f=tm_f, tm_r=tm_r,
-                                   seq_f=f_seq, seq_r=r_seq, ta=ta)
-                print(f"🧮 Tm  F={tm_f:.1f}°C  R={tm_r:.1f}°C   建議 Ta={ta:.1f}°C")
-                print(f"   條件：{_cond_line()}")
+with left:
+    if not products:
+        st.warning("❄️ 此溫度下無任何產物 —— 引子已脫落，或 3' 端無法延伸。試著調低溫度。")
+    else:
+        n_t = sum(1 for p in products if p["perfect"])
+        a, b = st.columns(2)
+        a.metric("完美配對產物", n_t)
+        b.metric("非專一性產物", len(products) - n_t)
 
-                bkw = dict(entrez_query=f'"{organism}"[Organism]',
-                           expect=1000, word_size=7,
-                           hitlist_size=500, megablast=False)
+        df = pd.DataFrame([{
+            "大小 (bp)": p["size"],
+            "類型": "✅ Target" if p["perfect"] else f"⚠️ 非專一 {p['pair']}",
+            "Tm-F": round(p["f_tm"], 1),
+            "Tm-R": round(p["r_tm"], 1),
+            "餘裕 (°C)": round(p["margin"], 1),
+            "Accession": p["id"],
+            "描述": p["title"][:70],
+        } for p in products])
+        st.dataframe(df, hide_index=True, height=340)
 
-                w_progress.value = 20
-                print("⏳ Forward 引子 BLAST 中…（NCBI 佇列可能要 1–3 分鐘）")
-                rec_f = NCBIXML.read(NCBIWWW.qblast("blastn", database, f_seq, **bkw))
+with right:
+    if products:
+        st.pyplot(draw_gel(products, temp, organism))
 
-                w_progress.value = 55
-                print("⏳ Reverse 引子 BLAST 中…")
-                rec_r = NCBIXML.read(NCBIWWW.qblast("blastn", database, r_seq, **bkw))
-
-                w_progress.value = 85
-                raw_blast_data["f"] = parse_hits(rec_f, f_seq, "F")
-                raw_blast_data["r"] = parse_hits(rec_r, r_seq, "R")
-                print(f"✅ 取得 F {len(raw_blast_data['f'])} 個 / "
-                      f"R {len(raw_blast_data['r'])} 個結合位點")
-
-                w_progress.value, w_progress.bar_style = 100, "success"
-
-                lo, hi = w_slider.min, w_slider.max
-                w_slider.value = float(np.clip(round(ta * 2) / 2, lo, hi))
-                if not (lo <= ta <= hi):
-                    print(f"⚠️ 建議 Ta {ta:.1f}°C 超出滑桿範圍 [{lo}, {hi}]，已夾擠")
-                update_simulation()
-
-            except Exception as e:
-                w_progress.bar_style = "danger"
-                print(f"❌ 錯誤：{type(e).__name__}: {e}")
-    finally:
-        btn_run.disabled = False
-        _busy.release()
-
-
-def on_run(_):
-    if not w_fwd.value.strip() or not w_rev.value.strip():
-        with log_output:
-            clear_output(wait=True)
-            print("請先填入兩條引子序列。")
-        return
-    btn_run.disabled = True
-    w_progress.value, w_progress.bar_style = 0, "info"
-    sim_output.clear_output()
-    threading.Thread(target=run_blast_thread,
-                     args=(w_fwd.value, w_rev.value, w_org.value, w_db.value),
-                     daemon=True).start()
-
-
-# =============================================================================
-#  9. 介面
-# =============================================================================
-
-style = {"description_width": "initial"}
-wide = widgets.Layout(width="98%")
-half = widgets.Layout(width="48%")
-num = widgets.Layout(width="215px")
-
-w_org = widgets.Dropdown(
-    options=[("人類", "Homo sapiens"), ("小鼠", "Mus musculus")],
-    value="Homo sapiens", description="物種:", style=style, layout=half)
-w_db = widgets.Dropdown(
-    options=[("mRNA (refseq_rna)", "refseq_rna"), ("Genomic (nt)", "nt")],
-    value="refseq_rna", description="資料庫:", style=style, layout=half)
-w_fwd = widgets.Text(placeholder="Forward primer 5'->3'", continuous_update=False,
-                     description="Fwd:", style=style, layout=wide)
-w_rev = widgets.Text(placeholder="Reverse primer 5'->3'", continuous_update=False,
-                     description="Rev:", style=style, layout=wide)
-
-# ---- Mg²⁺ 三模式 ----
-w_mg_mode = widgets.RadioButtons(
-    options=[("① 已知濃度（自配 buffer）", "known"),
-             ("② 未知 — 用區間估計（推薦：商業 master mix）", "range"),
-             ("③ 未知 — 由實驗 Ta 反推有效濃度（最準）", "solve")],
-    value="range", description="Mg²⁺:", style=style,
-    layout=widgets.Layout(width="98%"))
-
-w_mg = widgets.BoundedFloatText(value=1.5, min=0, max=10, step=0.1,
-                                description="Mg²⁺ (mM):", style=style, layout=num)
-box_known = widgets.HBox([w_mg])
-
-w_mg_lo = widgets.BoundedFloatText(value=1.0, min=0, max=10, step=0.1,
-                                   description="下限 (mM):", style=style, layout=num)
-w_mg_hi = widgets.BoundedFloatText(value=3.0, min=0, max=10, step=0.1,
-                                   description="上限 (mM):", style=style, layout=num)
-box_range = widgets.VBox([
-    widgets.HBox([w_mg_lo, w_mg_hi]),
-    widgets.HTML("<small>市售 2X Taq master mix 稀釋成 1X 後，Mg²⁺ 幾乎都落在 "
-                 "1.5–2.5 mM；1.0–3.0 是保守的涵蓋範圍。Tm 與建議 Ta 會以區間顯示。"
-                 "</small>")])
-
-w_obs_ta = widgets.BoundedFloatText(value=55.0, min=35, max=75, step=0.5,
-                                    description="實驗可行 Ta (°C):", style=style,
-                                    layout=widgets.Layout(width="260px"))
-btn_solve = widgets.Button(description="反推有效 Mg²⁺", button_style="info",
-                           icon="calculator", layout=widgets.Layout(width="180px"))
-w_mg_solved = widgets.BoundedFloatText(value=1.5, min=0, max=10, step=0.01,
-                                       description="反推結果 (mM):", style=style,
-                                       disabled=True, layout=num)
-solve_output = widgets.Output()
-box_solve = widgets.VBox([
-    widgets.HTML("<small>填入一組你<b>實際跑過、能得到乾淨單一 band</b> 的引子與 Ta，"
-                 "系統會反解出符合該結果的有效 Mg²⁺。一組已知答案就能校準整個模型。"
-                 "</small>"),
-    widgets.HBox([w_obs_ta, btn_solve, w_mg_solved]),
-    solve_output])
-
-w_dntp = widgets.BoundedFloatText(value=0.2, min=0, max=2, step=0.05,
-                                  description="dNTP each (mM):", style=style, layout=num)
-w_mono = widgets.BoundedFloatText(value=50, min=0, max=200, step=5,
-                                  description="K⁺ (mM):", style=style, layout=num)
-w_tris = widgets.BoundedFloatText(value=10, min=0, max=100, step=1,
-                                  description="Tris (mM):", style=style, layout=num)
-w_primer_nM = widgets.BoundedFloatText(value=200, min=10, max=2000, step=10,
-                                       description="Primer (nM):", style=style, layout=num)
-w_offset = widgets.BoundedFloatText(value=0.0, min=-15, max=15, step=0.5,
-                                    description="校正 offset (°C):", style=style, layout=num)
-w_selfpair = widgets.Checkbox(value=True, description="計入 F-F / R-R 自我配對產物",
-                              style=style, indent=False)
-
-tm_output = widgets.Output()
-btn_run = widgets.Button(description="連線 NCBI 取得結合位點", button_style="primary",
-                         icon="cloud-download", layout=widgets.Layout(width="100%"))
-w_progress = widgets.IntProgress(value=0, max=100, description="進度:",
-                                 bar_style="info", layout=wide)
-log_output = widgets.Output()
-w_slider = widgets.FloatSlider(value=58.0, min=35.0, max=78.0, step=0.5,
-                               description="Annealing Ta (°C):",
-                               continuous_update=False, readout_format=".1f",
-                               style=style, layout=wide)
-sim_output = widgets.Output()
-
-# ---- 事件綁定（每個只綁一次）----
-btn_run.on_click(on_run)
-btn_solve.on_click(on_solve)
-w_slider.observe(lambda ch: update_simulation(ch["new"]), names="value")
-w_mg_mode.observe(on_mg_mode, names="value")
-w_selfpair.observe(lambda ch: update_simulation(), names="value")
-for _w in (w_mg, w_mg_lo, w_mg_hi, w_mg_solved, w_dntp, w_mono,
-           w_tris, w_primer_nM, w_offset, w_fwd, w_rev):
-    _w.observe(refresh_tm_panel, names="value")
-
-ui = widgets.VBox([
-    widgets.HTML("<h3>🧬 PCR 戰情室 <small>v9.2 — Mg²⁺ 未知模式</small></h3>"),
-    widgets.HBox([w_org, w_db]),
-    w_fwd, w_rev,
-    widgets.HTML("<hr><b>🧪 反應條件</b>"),
-    w_mg_mode, box_known, box_range, box_solve,
-    widgets.HTML("<br>"),
-    widgets.HBox([w_dntp, w_mono, w_tris]),
-    widgets.HBox([w_primer_nM, w_offset]),
-    tm_output,
-    widgets.HTML("<hr>"),
-    btn_run, w_progress, log_output,
-    widgets.HTML("<hr><b>🎛️ 溫度模擬</b>"),
-    w_slider, w_selfpair, sim_output,
-])
-
-on_mg_mode(None)     # 初始化顯示/隱藏
-display(ui)
+with st.expander("🔬 所有結合位點明細"):
+    hd = pd.DataFrame([{
+        "引子": h["tag"], "Accession": h["id"],
+        "股": "+" if h["strand"] == 1 else "−",
+        "5'位置": h["five_prime"], "3'位置": h["three_prime"],
+        "Identity (%)": round(h["ident"], 1),
+        "Coverage (%)": round(h["coverage"], 1),
+        "Tm (°C)": round(h["tm"], 1) if h["tm"] is not None else None,
+        "可延伸": "✔" if h["ext_ok"] else "✘",
+        "3'端狀態": h["ext_note"],
+    } for h in hits_f + hits_r])
+    st.dataframe(hd.sort_values(["引子", "Tm (°C)"], ascending=[True, False]),
+                 hide_index=True, height=380)
+    st.caption("Identity 的分母是引子全長（不是 HSP 長度），所以只對到一半的短 HSP "
+               "不會再被誤判成 100% 的完美結合。")
