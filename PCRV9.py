@@ -306,14 +306,19 @@ def pair_products(hits_f, hits_r, temp: float, allow_self: bool = True):
 # =============================================================================
 
 def draw_gel(products, temp: float, organism: str):
-    fig, ax = plt.subplots(figsize=(7.5, 5.2), dpi=130)
+    """電泳模擬圖。
+
+    圖比例做成寬版（st.pyplot 預設 width='stretch' 會撐滿容器寬度），
+    放在頁面全寬處才不會因為擠在窄欄裡而看不清楚。
+    """
+    fig, ax = plt.subplots(figsize=(11, 4.8), dpi=120)
     fig.patch.set_facecolor("#0E1117")
     ax.set_facecolor("black")
 
     for b in (100, 200, 300, 400, 500, 600, 800, 1000, 1500, 2000, 3000, 5000):
         y = -np.log10(b)
-        ax.hlines(y, 0.5, 1.5, colors="white", alpha=0.45, linewidth=1.4)
-        ax.text(0.38, y, f"{b}", color="white", fontsize=6.5, va="center", ha="right")
+        ax.hlines(y, 0.45, 1.30, colors="white", alpha=0.45, linewidth=1.6)
+        ax.text(0.38, y, f"{b}", color="white", fontsize=8, va="center", ha="right")
 
     order = sorted(range(len(products)),
                    key=lambda i: (not products[i]["perfect"], -products[i]["margin"]))
@@ -322,25 +327,27 @@ def draw_gel(products, temp: float, organism: str):
         p = products[i]
         y = -np.log10(p["size"])
         if p["perfect"]:
-            color, alpha, lw, tag = "#00FF41", 1.0, 4.0, "Target"
+            color, alpha, lw, tag = "#00FF41", 1.0, 5.0, "Target"
         else:
             alpha = float(np.clip(0.25 + p["margin"] / 20.0, 0.2, 0.85))
-            color, lw, tag = "#FFD400", 2.0, f"Non-spec {p['pair']}"
-        ax.hlines(y, 2.4, 3.5, colors=color, alpha=alpha, linewidth=lw)
-        if labelled < 6:
-            ax.text(3.65, y, f"{p['size']} bp ({tag})", color=color,
-                    fontsize=7.5, va="center", alpha=max(alpha, 0.7))
+            color, lw, tag = "#FFD400", 2.4, f"Non-specific {p['pair']}"
+        ax.hlines(y, 1.95, 3.00, colors=color, alpha=alpha, linewidth=lw)
+        if labelled < 8:
+            ax.text(3.18, y, f"{p['size']} bp  ·  {tag}  ·  {p['id']}",
+                    color=color, fontsize=9, va="center",
+                    alpha=max(alpha, 0.75))
             labelled += 1
 
-    ax.set_xlim(0, 6.4)
+    ax.set_xlim(0, 7.2)
     ax.set_ylim(-np.log10(MAX_PRODUCT * 1.15), -np.log10(MIN_PRODUCT * 0.85))
-    ax.set_xticks([1, 2.95])
-    ax.set_xticklabels(["Marker", f"PCR @ {temp:.1f}°C"], color="white", fontsize=8)
+    ax.set_xticks([0.88, 2.48])
+    ax.set_xticklabels(["Marker", f"PCR @ {temp:.1f}°C"], color="white", fontsize=10)
     ax.tick_params(colors="white")
     ax.set_yticks([])
     for sp in ax.spines.values():
         sp.set_color("#333333")
-    ax.set_title(f"In-Silico PCR  ({organism})", color="white", fontsize=10)
+    ax.set_title(f"In-Silico PCR Simulation  ({organism})", color="white",
+                 fontsize=12, pad=10)
     fig.tight_layout()
     return fig
 
@@ -407,17 +414,21 @@ st.caption("In-silico PCR ・ 熱力學 Tm ・ 非專一性產物模擬　|　"
            "Tm 模型：SantaLucia & Hicks 2004 + Owczarzy 2008 鹽校正")
 
 c1, c2 = st.columns(2)
-f_seq = clean_seq(c1.text_input("Forward primer (5'→3')",
-                                "AGGTCAAAGAGGCTGCTTGG"))
-r_seq = clean_seq(c2.text_input("Reverse primer (5'→3')",
-                                "AACTGCATGGAATTGGTTGAC"))
+f_seq = clean_seq(c1.text_input(
+    "Forward primer (5'→3')", value="",
+    placeholder="貼上序列，例如 AGGTCAAAGAGGCTGCTTGG"))
+r_seq = clean_seq(c2.text_input(
+    "Reverse primer (5'→3')", value="",
+    placeholder="貼上序列，例如 AACTGCATGGAATTGGTTGAC"))
 
 bad = [n for n, s in (("Forward", f_seq), ("Reverse", r_seq)) if s and not valid_seq(s)]
 if bad:
     st.error(f"{'、'.join(bad)} 含有 A/T/G/C 以外的字元，無法計算 Tm。")
     st.stop()
 if not (f_seq and r_seq):
-    st.info("請輸入兩條引子序列。")
+    st.info("👆 貼上 Forward 與 Reverse 引子序列即可開始。\n\n"
+            "填好後會立刻算出 Tm 與建議 Annealing 溫度；"
+            "若還要模擬非專一性產物，再按下方的「查詢 NCBI」。")
     st.stop()
 
 
@@ -524,31 +535,32 @@ allow_self = sl2.checkbox("計入 F-F / R-R 產物", value=True,
 
 products = pair_products(hits_f, hits_r, temp, allow_self)
 
-left, right = st.columns([3, 2])
+if not products:
+    st.warning("❄️ 此溫度下無任何產物 —— 引子已脫落，或 3' 端無法延伸。試著調低溫度。")
+else:
+    n_t = sum(1 for p in products if p["perfect"])
+    a, b, c = st.columns(3)
+    a.metric("完美配對產物", n_t)
+    b.metric("非專一性產物", len(products) - n_t)
+    c.metric("目前 Ta", f"{temp:.1f} °C")
 
-with left:
-    if not products:
-        st.warning("❄️ 此溫度下無任何產物 —— 引子已脫落，或 3' 端無法延伸。試著調低溫度。")
-    else:
-        n_t = sum(1 for p in products if p["perfect"])
-        a, b = st.columns(2)
-        a.metric("完美配對產物", n_t)
-        b.metric("非專一性產物", len(products) - n_t)
+    # ---- 電泳圖放在最上方、佔滿整頁寬度 ----
+    # st.pyplot 預設 width='stretch'，全寬時圖會自動放大，
+    # 不會再因為擠在窄欄裡而看不清楚。
+    st.pyplot(draw_gel(products, temp, organism))
 
-        df = pd.DataFrame([{
-            "大小 (bp)": p["size"],
-            "類型": "✅ Target" if p["perfect"] else f"⚠️ 非專一 {p['pair']}",
-            "Tm-F": round(p["f_tm"], 1),
-            "Tm-R": round(p["r_tm"], 1),
-            "餘裕 (°C)": round(p["margin"], 1),
-            "Accession": p["id"],
-            "描述": p["title"][:70],
-        } for p in products])
-        st.dataframe(df, hide_index=True, height=340)
-
-with right:
-    if products:
-        st.pyplot(draw_gel(products, temp, organism))
+    # ---- 產物明細表 ----
+    st.markdown("**產物明細**")
+    df = pd.DataFrame([{
+        "大小 (bp)": p["size"],
+        "類型": "✅ Target" if p["perfect"] else f"⚠️ 非專一 {p['pair']}",
+        "Tm-F": round(p["f_tm"], 1),
+        "Tm-R": round(p["r_tm"], 1),
+        "餘裕 (°C)": round(p["margin"], 1),
+        "Accession": p["id"],
+        "描述": p["title"][:90],
+    } for p in products])
+    st.dataframe(df, hide_index=True, height=320)
 
 with st.expander("🔬 所有結合位點明細"):
     hd = pd.DataFrame([{
