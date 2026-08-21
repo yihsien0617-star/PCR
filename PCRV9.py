@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -305,49 +306,126 @@ def pair_products(hits_f, hits_r, temp: float, allow_self: bool = True):
 #  電泳圖
 # =============================================================================
 
-def draw_gel(products, temp: float, organism: str):
+# 常見市售 DNA ladder。bright = 廠商刻意做亮、用來快速定位的參考帶。
+LADDERS = {
+    "100 bp DNA Ladder": {
+        "bands": [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200, 1500],
+        "bright": [500, 1000],
+    },
+    "100 bp Plus DNA Ladder": {
+        "bands": [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000,
+                  1200, 1500, 2000, 3000],
+        "bright": [500, 1500, 3000],
+    },
+    "1 kb DNA Ladder": {
+        "bands": [250, 500, 750, 1000, 1500, 2000, 2500, 3000,
+                  4000, 5000, 6000, 8000, 10000],
+        "bright": [1000, 3000],
+    },
+    "1 kb Plus DNA Ladder": {
+        "bands": [100, 200, 300, 400, 500, 650, 850, 1000, 1650,
+                  2000, 3000, 4000, 5000, 6000, 8000, 10000],
+        "bright": [1000, 3000],
+    },
+}
+
+
+def _band(ax, x0, x1, y, color, intensity=1.0, thickness=0.016, zbase=3):
+    """畫一條帶。用三層由外而內疊加模擬 EtBr / SYBR 螢光的暈開效果，
+    看起來才像真的膠片，而不是一條數學線段。"""
+    intensity = float(np.clip(intensity, 0.05, 1.0))
+    for k, (spread, a) in enumerate(((3.0, 0.09), (1.9, 0.20), (1.0, 1.0))):
+        h = thickness * spread
+        ax.add_patch(Rectangle((x0, y - h / 2), x1 - x0, h,
+                               facecolor=color, edgecolor="none",
+                               alpha=a * intensity, zorder=zbase + k))
+
+
+def draw_gel(products, temp: float, organism: str, ladder_name: str):
     """電泳模擬圖。
 
+    座標軸：y = log10(片段大小)，所以**大片段在上、小片段在下**，
+    與真實跑膠一致（大片段留在井附近，小片段跑得遠）。
+    log 尺度也正好對應瓊脂糖凝膠中遷移率與 log(bp) 的近似線性關係。
+
     圖比例做成寬版（st.pyplot 預設 width='stretch' 會撐滿容器寬度），
-    放在頁面全寬處才不會因為擠在窄欄裡而看不清楚。
+    放在全寬處才不會因為擠在窄欄裡而看不清楚。
     """
-    fig, ax = plt.subplots(figsize=(11, 4.8), dpi=120)
+    lad = LADDERS[ladder_name]
+    bands, bright = lad["bands"], set(lad["bright"])
+
+    sizes = bands + [p["size"] for p in products] + [MIN_PRODUCT, MAX_PRODUCT]
+    y_lo, y_hi = np.log10(min(sizes) * 0.70), np.log10(max(sizes) * 1.75)
+
+    fig, ax = plt.subplots(figsize=(11, 5.4), dpi=120)
     fig.patch.set_facecolor("#0E1117")
-    ax.set_facecolor("black")
+    ax.set_facecolor("#050505")
 
-    for b in (100, 200, 300, 400, 500, 600, 800, 1000, 1500, 2000, 3000, 5000):
-        y = -np.log10(b)
-        ax.hlines(y, 0.45, 1.30, colors="white", alpha=0.45, linewidth=1.6)
-        ax.text(0.38, y, f"{b}", color="white", fontsize=8, va="center", ha="right")
+    # --- 膠片底色：極淡的垂直漸層（上方靠近井處略亮），讓畫面不是死黑一片 ---
+    # 注意灰階值要壓在 0.02–0.11，否則整片會變成白底。
+    ax.imshow(np.linspace(0.11, 0.02, 256).reshape(-1, 1),
+              extent=[0, 7.2, y_lo, y_hi], aspect="auto",
+              cmap="gray", vmin=0.0, vmax=1.0,
+              zorder=0, interpolation="bilinear")
 
+    LANES = {"marker": (0.55, 1.45), "pcr": (2.15, 3.25)}
+
+    # --- 加樣井（在最上方，大片段的那一側）---
+    y_well = y_hi - (y_hi - y_lo) * 0.05
+    for x0, x1 in LANES.values():
+        ax.add_patch(Rectangle((x0, y_well - 0.018), x1 - x0, 0.036,
+                               facecolor="#1a1a1a", edgecolor="#3a3a3a",
+                               linewidth=0.8, zorder=2))
+
+    # --- Marker ---
+    mx0, mx1 = LANES["marker"]
+    for b in bands:
+        y = np.log10(b)
+        is_ref = b in bright
+        _band(ax, mx0, mx1, y, "#EAEAEA",
+              intensity=0.95 if is_ref else 0.55,
+              thickness=0.026 if is_ref else 0.015)
+        ax.text(mx0 - 0.10, y, f"{b:,}", color="white" if is_ref else "#B8B8B8",
+                fontsize=8.5 if is_ref else 7.5, va="center", ha="right",
+                fontweight="bold" if is_ref else "normal", zorder=6)
+
+    # --- PCR 產物 ---
+    px0, px1 = LANES["pcr"]
     order = sorted(range(len(products)),
                    key=lambda i: (not products[i]["perfect"], -products[i]["margin"]))
     labelled = 0
     for i in order:
         p = products[i]
-        y = -np.log10(p["size"])
+        y = np.log10(p["size"])
         if p["perfect"]:
-            color, alpha, lw, tag = "#00FF41", 1.0, 5.0, "Target"
+            color, inten, thick, tag = "#00FF41", 1.0, 0.030, "Target"
         else:
-            alpha = float(np.clip(0.25 + p["margin"] / 20.0, 0.2, 0.85))
-            color, lw, tag = "#FFD400", 2.4, f"Non-specific {p['pair']}"
-        ax.hlines(y, 1.95, 3.00, colors=color, alpha=alpha, linewidth=lw)
+            # margin（Tm 高於 Ta 多少）越大 = 結合越牢 = 條帶越亮
+            inten = float(np.clip(0.22 + p["margin"] / 18.0, 0.18, 0.8))
+            color, thick, tag = "#FFD400", 0.017, f"Non-specific {p['pair']}"
+        _band(ax, px0, px1, y, color, intensity=inten, thickness=thick)
         if labelled < 8:
-            ax.text(3.18, y, f"{p['size']} bp  ·  {tag}  ·  {p['id']}",
+            ax.text(px1 + 0.16, y, f"{p['size']:,} bp  ·  {tag}  ·  {p['id']}",
                     color=color, fontsize=9, va="center",
-                    alpha=max(alpha, 0.75))
+                    alpha=max(inten, 0.78), zorder=6)
             labelled += 1
 
     ax.set_xlim(0, 7.2)
-    ax.set_ylim(-np.log10(MAX_PRODUCT * 1.15), -np.log10(MIN_PRODUCT * 0.85))
-    ax.set_xticks([0.88, 2.48])
-    ax.set_xticklabels(["Marker", f"PCR @ {temp:.1f}°C"], color="white", fontsize=10)
-    ax.tick_params(colors="white")
+    ax.set_ylim(y_lo, y_hi)          # 小片段在下、大片段在上
+    ax.set_xticks([(a + b) / 2 for a, b in LANES.values()])
+    ax.set_xticklabels([ladder_name, f"PCR @ {temp:.1f}°C"],
+                       color="white", fontsize=10)
+    ax.tick_params(colors="white", length=0, pad=8)
     ax.set_yticks([])
     for sp in ax.spines.values():
-        sp.set_color("#333333")
+        sp.set_color("#2A2A2A")
     ax.set_title(f"In-Silico PCR Simulation  ({organism})", color="white",
                  fontsize=12, pad=10)
+    # 圖內一律用 ASCII——matplotlib 預設字型沒有中文，中文會變成方框
+    ax.text(7.1, y_hi - (y_hi - y_lo) * 0.02, "large  ▲",
+            color="#777777", fontsize=7.5, ha="right", va="top", zorder=6)
+    ax.text(7.1, y_lo + (y_hi - y_lo) * 0.02, "small  ▼",
+            color="#777777", fontsize=7.5, ha="right", va="bottom", zorder=6)
     fig.tight_layout()
     return fig
 
@@ -527,10 +605,12 @@ except Exception as e:
 # ---------- 溫度模擬 ----------
 st.subheader("🎛️ 溫度模擬")
 
-sl1, sl2 = st.columns([3, 1])
+sl1, sl2, sl3 = st.columns([3, 1.4, 1])
 temp = sl1.slider("Annealing 溫度 Ta (°C)", 35.0, 78.0,
                   float(np.clip(round(ta * 2) / 2, 35.0, 78.0)), 0.5)
-allow_self = sl2.checkbox("計入 F-F / R-R 產物", value=True,
+ladder_name = sl2.selectbox("DNA Ladder", list(LADDERS.keys()), index=0,
+                            help="選你實驗室實際使用的 marker，圖上的參考帶會跟著對應。")
+allow_self = sl3.checkbox("計入 F-F / R-R 產物", value=True,
                           help="同一條引子分別落在正負股時也會產生真實的非專一性條帶。")
 
 products = pair_products(hits_f, hits_r, temp, allow_self)
@@ -547,7 +627,7 @@ else:
     # ---- 電泳圖放在最上方、佔滿整頁寬度 ----
     # st.pyplot 預設 width='stretch'，全寬時圖會自動放大，
     # 不會再因為擠在窄欄裡而看不清楚。
-    st.pyplot(draw_gel(products, temp, organism))
+    st.pyplot(draw_gel(products, temp, organism, ladder_name))
 
     # ---- 產物明細表 ----
     st.markdown("**產物明細**")
